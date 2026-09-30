@@ -808,6 +808,11 @@ function analyser(mail, trace) {
   const nomAffiche = mail.expediteurNom ||
     (deBrut.match(/^\s*"?([^"<]*?)"?\s*</) || [])[1] || '';
   const auth = resultatAuthentification(entetes);
+  const authLue = auth ? {
+    spf: (auth.match(/\bspf=([a-z]+)/) || [])[1] || 'absent',
+    dkim: (auth.match(/\bdkim=([a-z]+)/) || [])[1] || 'absent',
+    dmarc: (auth.match(/\bdmarc=([a-z]+)/) || [])[1] || 'absent',
+  } : null;
 
   const aEntetes = !!String(entetes).trim();
   const aDomaine = !!domaineDe_;
@@ -1134,6 +1139,7 @@ function analyser(mail, trace) {
 
   return {
     verdict, signaux, controles,
+    authentification: authLue,
     expediteur: { nomAffiche, domaine: domaineDe_, adresse: deBrut }
   };
 }
@@ -1909,7 +1915,20 @@ if (typeof module !== 'undefined') {
       objet: mail.objet || '',
       domainesLiens: domaines.slice(0, 15),
       piecesJointes: (mail.piecesJointes || []).slice(0, 10),
-      texte: texte
+      texte: texte,
+      /* Résultats calculés par la page, hors du texte du mail : l'expéditeur ne
+         peut pas les influencer. Sans eux, le modèle ignore que l'authentification
+         est passée et se replie par prudence sur une préoccupation moyenne. */
+      technique: {
+        authentification: analyse.authentification
+          ? 'SPF=' + analyse.authentification.spf + ', DKIM=' + analyse.authentification.dkim +
+            ', DMARC=' + analyse.authentification.dmarc
+          : 'non disponible dans le fichier',
+        signaux: analyse.signaux.slice(0, 10).map(function(s){
+          return s.titre + (s.force === 'fort' ? ' (signal fort)' : ' (signal faible)');
+        }),
+        verdict: analyse.verdict
+      }
     };
   }
 
@@ -1968,7 +1987,8 @@ if (typeof module !== 'undefined') {
       texte: 'Préparation de l\u2019envoi : adresses mail et paramètres de liens retirés' });
     C.ecrire({ type: 'info', noeud: 'ia',
       texte: 'Envoi de ' + envoi.texte.length + ' caractères, ' + envoi.domainesLiens.length +
-             ' domaine(s) de liens et ' + envoi.piecesJointes.length + ' nom(s) de pièce jointe à ' + service });
+             ' domaine(s) de liens, ' + envoi.piecesJointes.length + ' nom(s) de pièce jointe' +
+             ' et le résultat des contrôles techniques à ' + service });
     C.ecrire({ type: 'recherche', noeud: 'ia', texte: 'En attente de la réponse du modèle…' });
 
     fetch(REGLAGES.urlAnalyseIA, {
