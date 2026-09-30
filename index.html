@@ -645,7 +645,12 @@ function imiteUneMarque(domaine) {
 }
 
 function entete(entetes, nom) {
-  if (!entetes) return '';
+  return entetesListe(entetes, nom).join(' ');
+}
+
+/* Toutes les occurrences d'un en-tête, de la plus récente à la plus ancienne. */
+function entetesListe(entetes, nom) {
+  if (!entetes) return [];
   const lignes = String(entetes).replace(/\r\n/g, '\n').split('\n');
   const sortie = [];
   let courante = null;
@@ -656,10 +661,43 @@ function entete(entetes, nom) {
   }
   if (courante !== null) sortie.push(courante);
   const cible = nom.toLowerCase() + ':';
-  const trouvees = sortie
+  return sortie
     .filter((l) => l.toLowerCase().startsWith(cible))
     .map((l) => l.slice(cible.length).trim());
-  return trouvees.join(' ');
+}
+
+/* Seul compte le verdict du serveur qui a reçu le mail : c'est l'en-tête
+   Authentication-Results le plus récent, donc le plus haut. Les en-têtes ARC
+   conservent aussi les contrôles des relais intermédiaires (le relais interne
+   de l'expéditeur, avant signature par exemple), qui échouent souvent sans que
+   rien ne soit anormal : les additionner produit de fausses alertes.
+   Sans Authentication-Results, on prend le maillon ARC le plus récent (i le plus grand). */
+function resultatAuthentification(entetes) {
+  const direct = entetesListe(entetes, 'Authentication-Results')[0];
+  if (direct) return direct.toLowerCase();
+  let meilleur = '';
+  let rangMax = -1;
+  for (const arc of entetesListe(entetes, 'ARC-Authentication-Results')) {
+    const rang = parseInt((arc.match(/\bi\s*=\s*(\d+)/i) || [])[1] || '0', 10);
+    if (rang > rangMax) { rangMax = rang; meilleur = arc; }
+  }
+  return meilleur.toLowerCase();
+}
+
+/* Les mails en texte brut n'ont pas de HTML : les liens y sont écrits en clair. */
+function extraireLiensTexte(texte) {
+  const liens = [];
+  const re = /\bhttps?:\/\/[^\s<>"'\]\)]+/gi;
+  let m;
+  while ((m = re.exec(String(texte || ''))) !== null) {
+    liens.push({ href: m[0].replace(/[.,;:!?]+$/, ''), texte: '' });
+  }
+  return liens;
+}
+
+/* Liens du mail, qu'il soit mis en forme (HTML) ou en texte brut. */
+function liensDuMail(mail) {
+  return mail.corpsHtml ? extraireLiens(mail.corpsHtml) : extraireLiensTexte(mail.corpsTexte);
 }
 
 function extraireLiens(html) {
@@ -769,17 +807,21 @@ function analyser(mail, trace) {
   const domaineDe_ = domaineDe(deBrut) || domaineDe(mail.expediteurAdresse);
   const nomAffiche = mail.expediteurNom ||
     (deBrut.match(/^\s*"?([^"<]*?)"?\s*</) || [])[1] || '';
-  const auth = (entete(entetes, 'Authentication-Results') + ' ' +
-                entete(entetes, 'ARC-Authentication-Results')).trim().toLowerCase();
+  const auth = resultatAuthentification(entetes);
+  const authLue = auth ? {
+    spf: (auth.match(/\bspf=([a-z]+)/) || [])[1] || 'absent',
+    dkim: (auth.match(/\bdkim=([a-z]+)/) || [])[1] || 'absent',
+    dmarc: (auth.match(/\bdmarc=([a-z]+)/) || [])[1] || 'absent',
+  } : null;
 
   const aEntetes = !!String(entetes).trim();
   const aDomaine = !!domaineDe_;
-  const aCorps = !!mail.corpsHtml;
   const aTexte = !!String(mail.corpsTexte || '').trim();
+  const aCorps = !!mail.corpsHtml || aTexte;
 
   const SANS_ENTETES = 'le fichier ne contient pas les en-têtes du message';
   const SANS_ADRESSE = 'aucune adresse d’expéditeur exploitable dans le fichier';
-  const SANS_CORPS = 'le contenu mis en forme n’a pas pu être lu';
+  const SANS_CORPS = 'le contenu du message n’a pas pu être lu';
   const SANS_TEXTE = 'le texte du message n’a pas pu être lu';
   const SANS_AUTH = aEntetes ? 'les en-têtes ne portent pas le résultat de ces contrôles' : SANS_ENTETES;
 
@@ -847,7 +889,7 @@ function analyser(mail, trace) {
 
   /* 6. Liens trompeurs */
   let liensReecrits = 0;
-  const liens = extraireLiens(mail.corpsHtml).map((l) => {
+  const liens = liensDuMail(mail).map((l) => {
     const d = deballerLien(l.href);
     if (d.opaque) liensReecrits++;
     return { href: d.url, texte: l.texte, opaque: d.opaque };
@@ -1097,12 +1139,13 @@ function analyser(mail, trace) {
 
   return {
     verdict, signaux, controles,
+    authentification: authLue,
     expediteur: { nomAffiche, domaine: domaineDe_, adresse: deBrut }
   };
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { analyser, entete, extraireLiens, racine, imiteUnDomaineInterne };
+  module.exports = { analyser, entete, extraireLiens, extraireLiensTexte, racine, imiteUnDomaineInterne };
 }
 </script>
 <script>
@@ -1702,7 +1745,7 @@ if (typeof module !== 'undefined') {
       piecesJointes: pj,
       diagnostic: {
         entetes: entetes ? entetes.length + ' caractères' : 'absents',
-        corps: origineCorps ? 'lu (' + origineCorps + ')' : 'non lu',
+        corps: origineCorps ? 'lu (' + origineCorps + ')' : (d.body ? 'lu (texte brut)' : 'non lu'),
         adresse: adresse || (exchangeSeul ? 'identifiant interne Exchange seulement' : 'introuvable'),
         liens: 'à calculer',
         pieces: pj.length ? pj.join(', ') : 'aucune',
@@ -1860,8 +1903,9 @@ if (typeof module !== 'undefined') {
       .slice(0, 6000);
 
     var domaines = [];
-    extraireLiens(mail.corpsHtml).forEach(function(l){
-      var h = (l.href.match(/^\s*https?:\/\/([^/?#\s]+)/i)||[])[1];
+    liensDuMail(mail).forEach(function(l){
+      /* La vraie destination, pas l'adresse de la protection Safe Links. */
+      var h = hoteDeUrl(deballerLien(l.href).url);
       if(h){ h = h.toLowerCase(); if(domaines.indexOf(h) === -1) domaines.push(h); }
     });
 
@@ -1871,7 +1915,20 @@ if (typeof module !== 'undefined') {
       objet: mail.objet || '',
       domainesLiens: domaines.slice(0, 15),
       piecesJointes: (mail.piecesJointes || []).slice(0, 10),
-      texte: texte
+      texte: texte,
+      /* Résultats calculés par la page, hors du texte du mail : l'expéditeur ne
+         peut pas les influencer. Sans eux, le modèle ignore que l'authentification
+         est passée et se replie par prudence sur une préoccupation moyenne. */
+      technique: {
+        authentification: analyse.authentification
+          ? 'SPF=' + analyse.authentification.spf + ', DKIM=' + analyse.authentification.dkim +
+            ', DMARC=' + analyse.authentification.dmarc
+          : 'non disponible dans le fichier',
+        signaux: analyse.signaux.slice(0, 10).map(function(s){
+          return s.titre + (s.force === 'fort' ? ' (signal fort)' : ' (signal faible)');
+        }),
+        verdict: analyse.verdict
+      }
     };
   }
 
@@ -1930,7 +1987,8 @@ if (typeof module !== 'undefined') {
       texte: 'Préparation de l\u2019envoi : adresses mail et paramètres de liens retirés' });
     C.ecrire({ type: 'info', noeud: 'ia',
       texte: 'Envoi de ' + envoi.texte.length + ' caractères, ' + envoi.domainesLiens.length +
-             ' domaine(s) de liens et ' + envoi.piecesJointes.length + ' nom(s) de pièce jointe à ' + service });
+             ' domaine(s) de liens, ' + envoi.piecesJointes.length + ' nom(s) de pièce jointe' +
+             ' et le résultat des contrôles techniques à ' + service });
     C.ecrire({ type: 'recherche', noeud: 'ia', texte: 'En attente de la réponse du modèle…' });
 
     fetch(REGLAGES.urlAnalyseIA, {
@@ -2091,10 +2149,11 @@ if (typeof module !== 'undefined') {
           (aTexte ? ' — ' + String(mail.corpsTexte).replace(/\s+/g, ' ').trim().split(' ').length + ' mots' : '') }
       : { type: 'impossible', noeud: 'corps', texte: 'Corps du message illisible' });
 
-    var n = extraireLiens(mail.corpsHtml).length;
-    C.ecrire(mail.corpsHtml
-      ? { type: 'info', noeud: 'liens', texte: 'Extraction des liens : ' + n + ' trouvé(s)' }
-      : { type: 'impossible', noeud: 'liens', texte: 'Liens non extractibles : pas de contenu mis en forme' });
+    var n = liensDuMail(mail).length;
+    C.ecrire(mail.corpsHtml || aTexte
+      ? { type: 'info', noeud: 'liens', texte: 'Extraction des liens' +
+          (mail.corpsHtml ? '' : ' (texte brut)') + ' : ' + n + ' trouvé(s)' }
+      : { type: 'impossible', noeud: 'liens', texte: 'Liens non extractibles : corps du message illisible' });
 
     var pj = mail.piecesJointes || [];
     C.ecrire({ type: 'info', noeud: 'pj', texte: pj.length
@@ -2138,7 +2197,7 @@ if (typeof module !== 'undefined') {
         return;
       }
       if(mail.diagnostic){
-        var n = extraireLiens(mail.corpsHtml).length;
+        var n = liensDuMail(mail).length;
         mail.diagnostic.liens = n ? n + '' : 'aucun';
         analyse.diagnostic = mail.diagnostic;
       }
